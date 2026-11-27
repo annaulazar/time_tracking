@@ -4,7 +4,7 @@ from pathlib import Path
 
 import AppKit as kit
 import objc
-from Foundation import NSDate, NSLocale, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
+from Foundation import NSAttributedString, NSDate, NSLocale, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 from time_tracking.tracker import (
     MICROSECONDS_PER_SECOND,
@@ -18,6 +18,8 @@ from time_tracking.tracker import (
 APP_NAME = "Учёт времени"
 DB_PATH = Path.home() / "Library" / "Application Support" / "Time Tracking" / "time_tracking.sqlite3"
 COMPACT_HINT = "Правый клик или ⌘⇧M — развернуть окно."
+RUNNING_COLOR = kit.NSColor.colorWithSRGBRed_green_blue_alpha_(222 / 255, 94 / 255, 216 / 255, 1)
+STOPPED_COLOR = kit.NSColor.colorWithSRGBRed_green_blue_alpha_(70 / 255, 226 / 255, 73 / 255, 1)
 
 
 def label(view, title, frame, size=13, weight=kit.NSFontWeightRegular, *, secondary=False, digits=False):
@@ -35,8 +37,38 @@ def label(view, title, frame, size=13, weight=kit.NSFontWeightRegular, *, second
     return field
 
 
-def button(view, title, frame, target, action):
-    control = kit.NSButton.buttonWithTitle_target_action_(title, target, action)
+class RoundedButton(kit.NSButton):
+    def drawRect_(self, rect):
+        color = self.fill_color
+        if self.isHighlighted():
+            color = color.blendedColorWithFraction_ofColor_(0.12, kit.NSColor.blackColor())
+        color.setFill()
+        kit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            self.bounds(), self.corner_radius, self.corner_radius
+        ).fill()
+        objc.super(RoundedButton, self).drawRect_(rect)
+
+    @objc.python_method
+    def set_style(self, title, color):
+        if self.title() == title and self.fill_color == color:
+            return
+        self.fill_color = color
+        attributes = {
+            kit.NSFontAttributeName: self.font(),
+            kit.NSForegroundColorAttributeName: self.text_color,
+        }
+        self.setAttributedTitle_(NSAttributedString.alloc().initWithString_attributes_(title, attributes))
+        self.setNeedsDisplay_(True)
+
+
+def button(view, title, frame, target, action, *, font_size, color, text_color, corner_radius=8):
+    control = RoundedButton.buttonWithTitle_target_action_("", target, action)
+    control.fill_color = None
+    control.text_color = text_color
+    control.corner_radius = corner_radius
+    control.setBordered_(False)
+    control.setFont_(kit.NSFont.systemFontOfSize_weight_(font_size, kit.NSFontWeightSemibold))
+    control.set_style(title, color)
     control.setFrame_(frame)
     view.addSubview_(control)
     return control
@@ -95,8 +127,9 @@ class AppController(NSObject):
     @objc.python_method
     def _build_main_window(self):
         style = kit.NSWindowStyleMaskTitled | kit.NSWindowStyleMaskClosable | kit.NSWindowStyleMaskMiniaturizable
+        content_width = 648
         self.window = kit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (480, 350)), style, kit.NSBackingStoreBuffered, False
+            ((0, 0), (content_width + 48, 444)), style, kit.NSBackingStoreBuffered, False
         )
         self.window.setReleasedWhenClosed_(False)
         self.window.setTitle_(APP_NAME)
@@ -104,21 +137,25 @@ class AppController(NSObject):
         self.window.center()
         view = self.window.contentView()
 
-        label(view, "Рабочее время", ((24, 298), (275, 33)), 27, kit.NSFontWeightSemibold)
-        self.status = label(view, "", ((25, 271), (330, 20)), secondary=True)
-        compact = button(view, "Компактно", ((346, 299), (112, 30)), self, "switchView:")
+        label(view, "Рабочее время", ((24, 392), (275, 33)), 27, kit.NSFontWeightSemibold)
+        self.status = label(view, "", ((25, 363), (330, 20)), secondary=True)
+        compact = button(
+            view, "Компактно", ((504, 386), (168, 45)), self, "switchView:",
+            font_size=19.5, color=kit.NSColor.controlBackgroundColor(), text_color=kit.NSColor.labelColor(),
+        )
         compact.setToolTip_("Свернуть окно до кнопки таймера")
 
         for index, title in enumerate(("Сегодня", "На этой неделе")):
-            summary = card(view, ((24 + index * 222, 174), (210, 79)))
+            summary = card(view, ((24 + index * 330, 266), (318, 79)))
             label(summary, title, ((16, 51), (179, 19)), secondary=True)
-            value = label(summary, "", ((16, 12), (179, 33)), 25, kit.NSFontWeightSemibold, digits=True)
+            value = label(summary, "", ((16, 12), (286, 33)), 25, kit.NSFontWeightSemibold, digits=True)
             if index == 0:
                 self.today_total = value
             else:
                 self.week_total = value
 
-        report = card(view, ((24, 66), (432, 96)))
+        report = card(view, ((24, 110), (content_width, 144)))
+        report.scaleUnitSquareToSize_((1.5, 1.5))
         label(report, "За выбранный период", ((16, 59), (239, 23)), 15, kit.NSFontWeightSemibold)
         self.period_total = label(report, "", ((256, 55), (160, 31)), 22, kit.NSFontWeightSemibold, digits=True)
         self.period_total.setAlignment_(kit.NSTextAlignmentRight)
@@ -130,21 +167,29 @@ class AppController(NSObject):
         self.period_error = label(report, "", ((16, 2), (400, 17)), 11)
         self.period_error.setTextColor_(kit.NSColor.systemRedColor())
 
-        self.main_button = button(view, "", ((24, 16), (432, 38)), self, "toggleTimer:")
-        self.main_button.setControlSize_(kit.NSControlSizeLarge)
+        self.main_button = button(
+            view, "", ((24, 16), (content_width, 76)), self, "toggleTimer:",
+            font_size=26, color=STOPPED_COLOR, text_color=kit.NSColor.blackColor(),
+        )
 
     @objc.python_method
     def _build_compact_panel(self):
+        button_frame = ((0, 0), (272, 76))
         self.panel = CompactPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (144, 44)), kit.NSWindowStyleMaskBorderless, kit.NSBackingStoreBuffered, False
+            button_frame, kit.NSWindowStyleMaskBorderless, kit.NSBackingStoreBuffered, False
         )
         self.panel.setTitle_(APP_NAME)
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(kit.NSColor.clearColor())
+        self.panel.setHasShadow_(False)
         self.panel.setFloatingPanel_(True)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setMovableByWindowBackground_(True)
         self.panel.setCollectionBehavior_(kit.NSWindowCollectionBehaviorMoveToActiveSpace)
-        self.compact_button = button(self.panel.contentView(), "", ((4, 3), (136, 38)), self, "toggleTimer:")
-        self.compact_button.setControlSize_(kit.NSControlSizeLarge)
+        self.compact_button = button(
+            self.panel.contentView(), "", button_frame, self, "toggleTimer:",
+            font_size=26, color=STOPPED_COLOR, text_color=kit.NSColor.blackColor(), corner_radius=3,
+        )
 
     @objc.python_method
     def _build_menus(self):
@@ -187,8 +232,9 @@ class AppController(NSObject):
     @objc.python_method
     def _refresh(self):
         running = self.tracker.is_running
-        self.main_button.setTitle_("Остановить таймер" if running else "Начать отсчёт")
-        self.compact_button.setTitle_("Остановить" if running else "Начать")
+        color = RUNNING_COLOR if running else STOPPED_COLOR
+        self.main_button.set_style("Остановить таймер" if running else "Начать отсчёт", color)
+        self.compact_button.set_style("Отдыхать" if running else "Работать", color)
         self.compact_button.setToolTip_(COMPACT_HINT)
         self.status.setStringValue_("Идёт учёт времени" if running else "Таймер остановлен")
         self.status.setTextColor_(kit.NSColor.systemGreenColor() if running else kit.NSColor.secondaryLabelColor())
