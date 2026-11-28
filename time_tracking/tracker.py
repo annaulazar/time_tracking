@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 MICROSECONDS_PER_SECOND = 1_000_000
+MICROSECONDS_PER_MINUTE = 60 * MICROSECONDS_PER_SECOND
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -20,12 +21,16 @@ def start_of_day(day: date) -> int:
 
 
 def format_duration(microseconds: int) -> str:
-    minutes = microseconds // (60 * MICROSECONDS_PER_SECOND)
+    minutes = microseconds // MICROSECONDS_PER_MINUTE
     hours, minutes = divmod(minutes, 60)
     return f"{hours} ч {minutes:02d} мин"
 
 
 class TrackerAlreadyOpen(RuntimeError):
+    pass
+
+
+class InsufficientWorkTime(ValueError):
     pass
 
 
@@ -55,6 +60,10 @@ class TimeTracker:
                         ended_at INTEGER NOT NULL CHECK (ended_at >= started_at)
                     );
                     CREATE INDEX IF NOT EXISTS sessions_end ON sessions (ended_at);
+                    CREATE TABLE IF NOT EXISTS daily_adjustments (
+                        day TEXT PRIMARY KEY NOT NULL,
+                        delta INTEGER NOT NULL
+                    );
                     """
                 )
             except sqlite3.Error:
@@ -97,9 +106,53 @@ class TimeTracker:
         self._connection.close()
         self._lock.close()
 
+    def adjust_minutes(self, day: date, minutes: int) -> None:
+        if minutes == 0:
+            raise ValueError("Adjustment must be nonzero")
+        change = minutes * MICROSECONDS_PER_MINUTE
+        self.checkpoint()
+        day_key = day.isoformat()
+        with self._connection:
+            row = self._connection.execute(
+                "SELECT delta FROM daily_adjustments WHERE day = ?", (day_key,)
+            ).fetchone()
+            previous = row[0] if row else 0
+            if previous < 0 or change < 0:
+                recorded = self._session_total(day, day)
+                previous = max(previous, -recorded)
+                if recorded + previous + change < 0:
+                    raise InsufficientWorkTime
+
+            delta = previous + change
+            if abs(delta) > MAX_SQLITE_INTEGER:
+                raise ValueError("Adjustment is out of range")
+            self._connection.execute(
+                """
+                INSERT INTO daily_adjustments (day, delta) VALUES (?, ?)
+                ON CONFLICT (day) DO UPDATE SET delta = excluded.delta
+                """,
+                (day_key, delta),
+            )
+
     def total(self, first_day: date, last_day: date) -> int:
         if first_day > last_day:
             raise ValueError("first_day must not be after last_day")
+        recorded = self._session_total(first_day, last_day)
+        adjustments = self._connection.execute(
+            "SELECT day, delta FROM daily_adjustments WHERE day BETWEEN ? AND ?",
+            (first_day.isoformat(), last_day.isoformat()),
+        )
+        adjustment_total = 0
+        for day_key, delta in adjustments:
+            if delta < 0:
+                # Calendar boundaries may shift when the Mac changes time zones.
+                day = date.fromisoformat(day_key)
+                day_total = recorded if first_day == last_day else self._session_total(day, day)
+                delta = max(delta, -day_total)
+            adjustment_total += delta
+        return recorded + adjustment_total
+
+    def _session_total(self, first_day: date, last_day: date) -> int:
         start = start_of_day(first_day)
         end = (
             MAX_SQLITE_INTEGER

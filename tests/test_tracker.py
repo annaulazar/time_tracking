@@ -1,12 +1,15 @@
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
 from time_tracking.tracker import (
     MICROSECONDS_PER_SECOND,
+    InsufficientWorkTime,
     TimeTracker,
     TrackerAlreadyOpen,
     format_duration,
@@ -98,6 +101,55 @@ os._exit(0)
         self.open_tracker()
         with self.assertRaises(TrackerAlreadyOpen):
             TimeTracker(self.path)
+
+    def test_adjustments_affect_only_reports_that_include_the_selected_day(self):
+        tracker = self.open_tracker()
+        tracker.start()
+        self.now += 25 * MINUTE
+        tracker.stop()
+        tracker.adjust_minutes(self.sunday, 60)
+        tracker.adjust_minutes(self.monday, -9)
+
+        self.assertEqual(tracker.total(self.sunday, self.sunday), 70 * MINUTE)
+        self.assertEqual(tracker.total(self.monday, self.monday + timedelta(days=6)), 6 * MINUTE)
+        self.assertEqual(tracker.total(self.sunday, self.monday), 76 * MINUTE)
+
+    def test_subtraction_uses_the_active_session_and_rejects_a_negative_day(self):
+        tracker = self.open_tracker()
+        tracker.start()
+        self.now += 7 * MINUTE
+        tracker.adjust_minutes(self.sunday, -6)
+        with self.assertRaises(InsufficientWorkTime):
+            tracker.adjust_minutes(self.sunday, -2)
+
+        self.assertTrue(tracker.is_running)
+        self.assertEqual(tracker.total(self.sunday, self.sunday), MINUTE)
+        tracker.adjust_minutes(self.sunday, -1)
+        self.assertEqual(tracker.total(self.sunday, self.sunday), 0)
+        self.now += 2 * MINUTE
+        tracker.stop()
+        self.assertEqual(tracker.total(self.sunday, self.sunday), 2 * MINUTE)
+
+    def test_legacy_database_keeps_sessions_and_persists_adjustments(self):
+        with closing(sqlite3.connect(self.path)) as legacy:
+            legacy.execute("CREATE TABLE sessions (id INTEGER PRIMARY KEY, started_at INTEGER, ended_at INTEGER)")
+            legacy.execute(
+                "INSERT INTO sessions (started_at, ended_at) VALUES (?, ?)",
+                (self.now, self.now + 8 * MINUTE),
+            )
+            legacy.commit()
+
+        tracker = TimeTracker(self.path, clock=lambda: self.now)
+        self.assertEqual(tracker.total(self.sunday, self.sunday), 8 * MINUTE)
+        tracker.adjust_minutes(self.sunday, 80)
+        tracker.close()
+
+        reopened = self.open_tracker()
+        self.assertEqual(reopened.total(self.sunday, self.sunday), 88 * MINUTE)
+        with closing(sqlite3.connect(self.path)) as database:
+            self.assertEqual(database.execute("SELECT started_at, ended_at FROM sessions").fetchall(), [
+                (self.now, self.now + 8 * MINUTE),
+            ])
 
     def test_displays_total_hours_even_when_over_a_day(self):
         self.assertEqual(format_duration((25 * 60 + 7) * MINUTE), "25 ч 07 мин")

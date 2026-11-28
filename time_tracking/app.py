@@ -7,7 +7,9 @@ import objc
 from Foundation import NSAttributedString, NSDate, NSLocale, NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 from time_tracking.tracker import (
+    MICROSECONDS_PER_MINUTE,
     MICROSECONDS_PER_SECOND,
+    InsufficientWorkTime,
     TimeTracker,
     TrackerAlreadyOpen,
     format_duration,
@@ -161,7 +163,7 @@ def card(view, frame):
     return box.contentView()
 
 
-def date_picker(view, initial_date, name, frame, target):
+def date_picker(view, initial_date, name, frame, target=None):
     picker = kit.NSDatePicker.alloc().initWithFrame_(frame)
     picker.setDatePickerStyle_(kit.NSDatePickerStyleTextFieldAndStepper)
     picker.setDatePickerElements_(kit.NSDatePickerElementFlagYearMonthDay)
@@ -169,10 +171,27 @@ def date_picker(view, initial_date, name, frame, target):
     initial_timestamp = start_of_day(initial_date) / MICROSECONDS_PER_SECOND
     picker.setDateValue_(NSDate.dateWithTimeIntervalSince1970_(initial_timestamp))
     picker.setAccessibilityLabel_(name)
-    picker.setTarget_(target)
-    picker.setAction_("periodChanged:")
+    if target is not None:
+        picker.setTarget_(target)
+        picker.setAction_("periodChanged:")
     view.addSubview_(picker)
     return picker
+
+
+def picker_date(picker):
+    return date.fromtimestamp(picker.dateValue().timeIntervalSince1970())
+
+
+def duration_field(view, caption, x):
+    label(view, caption, ((x, 68), (72, 20)), secondary=True)
+    field = kit.NSTextField.textFieldWithString_("")
+    field.setPlaceholderString_("0")
+    field.setAccessibilityLabel_(caption)
+    field.setAlignment_(kit.NSTextAlignmentCenter)
+    field.setFont_(kit.NSFont.monospacedDigitSystemFontOfSize_weight_(16, kit.NSFontWeightRegular))
+    field.setFrame_(((x, 37), (72, 29)))
+    view.addSubview_(field)
+    return field
 
 
 def show_alert(message, detail):
@@ -205,8 +224,9 @@ class AppController(NSObject):
     def _build_main_window(self):
         style = kit.NSWindowStyleMaskTitled | kit.NSWindowStyleMaskClosable | kit.NSWindowStyleMaskMiniaturizable
         content_width = 648
+        report_y = 246
         self.window = kit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (content_width + 48, 444)), style, kit.NSBackingStoreBuffered, False
+            ((0, 0), (content_width + 48, 580)), style, kit.NSBackingStoreBuffered, False
         )
         self.window.setReleasedWhenClosed_(False)
         self.window.setTitle_(APP_NAME)
@@ -214,16 +234,16 @@ class AppController(NSObject):
         self.window.center()
         view = self.window.contentView()
 
-        label(view, "Рабочее время", ((24, 392), (275, 33)), 27, kit.NSFontWeightSemibold)
-        self.status = label(view, "", ((25, 355), (330, 28)), CAPTION_SIZE, secondary=True)
+        label(view, "Рабочее время", ((24, 528), (275, 33)), 27, kit.NSFontWeightSemibold)
+        self.status = label(view, "", ((25, 491), (330, 28)), CAPTION_SIZE, secondary=True)
         compact = button(
-            view, "Компактно", ((504, 386), (168, 45)), self, "switchView:",
+            view, "Компактно", ((504, 522), (168, 45)), self, "switchView:",
             font_size=19.5, fill=COMPACT_TOGGLE_GRAY, text_color=kit.NSColor.labelColor(),
         )
         compact.setToolTip_("Свернуть окно до кнопки таймера")
 
         for index, title in enumerate(("Сегодня", "На этой неделе")):
-            summary = card(view, ((24 + index * 330, 266), (318, 79)))
+            summary = card(view, ((24 + index * 330, 402), (318, 79)))
             label(summary, title, ((16, 45), (286, 27)), CAPTION_SIZE, secondary=True)
             value = label(summary, "", ((16, 10), (286, 33)), TOTAL_SIZE, kit.NSFontWeightSemibold, digits=True)
             if index == 0:
@@ -231,14 +251,15 @@ class AppController(NSObject):
             else:
                 self.week_total = value
 
-        report = card(view, ((24, 110), (content_width, 144)))
+        report = card(view, ((24, report_y), (content_width, 144)))
         report_scale = 1.5
         report.scaleUnitSquareToSize_((report_scale, report_scale))
         label(report, "За выбранный период", ((16, 56), (239, 22)), CAPTION_SIZE / report_scale, kit.NSFontWeightSemibold)
+        week_total_frame = self.week_total.convertRect_toView_(self.week_total.bounds(), view)
         self.period_total = label(
-            report, "", ((256, 54), (160, 26)), TOTAL_SIZE / report_scale, kit.NSFontWeightSemibold, digits=True
+            view, "", ((week_total_frame.origin.x, report_y + 81), (286, 33)),
+            TOTAL_SIZE, kit.NSFontWeightSemibold, digits=True,
         )
-        self.period_total.setAlignment_(kit.NSTextAlignmentRight)
         today = date.today()
         label(report, "С", ((16, 23), (15, 20)), secondary=True)
         self.first_date = date_picker(report, today.replace(day=1), "Начало периода", ((35, 20), (137, 24)), self)
@@ -247,10 +268,28 @@ class AppController(NSObject):
         self.period_error = label(report, "", ((16, 2), (400, 17)), 11)
         self.period_error.setTextColor_(kit.NSColor.systemRedColor())
 
+        self._build_adjustment_card(card(view, ((24, 104), (content_width, 130))), today)
         self.main_button = button(
             view, "", ((24, 16), (content_width, 76)), self, "toggleTimer:",
             font_size=30, fill=STOPPED_GRADIENT, text_color=kit.NSColor.whiteColor(), corner_radius=34,
         )
+
+    @objc.python_method
+    def _build_adjustment_card(self, view, today):
+        label(view, "Ручная корректировка", ((16, 94), (380, 27)), CAPTION_SIZE, kit.NSFontWeightSemibold)
+        label(view, "Дата", ((16, 68), (144, 20)), secondary=True)
+        self.adjustment_date = date_picker(view, today, "Дата корректировки", ((16, 37), (148, 29)))
+        self.adjustment_hours = duration_field(view, "Часы", 182)
+        self.adjustment_minutes = duration_field(view, "Минуты", 270)
+        button(
+            view, "Добавить", ((370, 37), (125, 29)), self, "addTime:",
+            font_size=15, fill=COMPACT_TOGGLE_GRAY, text_color=kit.NSColor.labelColor(),
+        )
+        button(
+            view, "Убрать", ((507, 37), (125, 29)), self, "removeTime:",
+            font_size=15, fill=COMPACT_TOGGLE_GRAY, text_color=kit.NSColor.labelColor(),
+        )
+        self.adjustment_message = label(view, "", ((16, 9), (616, 20)), secondary=True)
 
     @objc.python_method
     def _build_compact_panel(self):
@@ -332,14 +371,65 @@ class AppController(NSObject):
         monday = today - timedelta(days=today.weekday())
         self.today_total.setStringValue_(format_duration(today_duration))
         self.week_total.setStringValue_(format_duration(self.tracker.total(monday, monday + timedelta(days=6))))
-        first = date.fromtimestamp(self.first_date.dateValue().timeIntervalSince1970())
-        last = date.fromtimestamp(self.last_date.dateValue().timeIntervalSince1970())
+        first = picker_date(self.first_date)
+        last = picker_date(self.last_date)
         if first > last:
             self.period_total.setStringValue_("—")
             self.period_error.setStringValue_("Дата начала должна быть раньше даты конца или совпадать с ней.")
         else:
             self.period_total.setStringValue_(format_duration(self.tracker.total(first, last)))
             self.period_error.setStringValue_("")
+
+    @objc.python_method
+    def _show_adjustment_message(self, text, *, error=False):
+        self.adjustment_message.setStringValue_(text)
+        self.adjustment_message.setTextColor_(
+            kit.NSColor.systemRedColor() if error else kit.NSColor.secondaryLabelColor()
+        )
+
+    @objc.python_method
+    def _adjust_time(self, direction):
+        if not self.window.makeFirstResponder_(None):
+            return
+        hours_text = self.adjustment_hours.stringValue().strip() or "0"
+        minutes_text = self.adjustment_minutes.stringValue().strip() or "0"
+        try:
+            if not hours_text.isdecimal() or not minutes_text.isdecimal():
+                raise ValueError
+            hours, minutes = int(hours_text), int(minutes_text)
+            if minutes > 59 or hours == minutes == 0:
+                raise ValueError
+        except ValueError:
+            self._show_adjustment_message("Введите длительность. Минуты должны быть от 0 до 59.", error=True)
+            return
+
+        day = picker_date(self.adjustment_date)
+        duration = hours * 60 + minutes
+        try:
+            self.tracker.adjust_minutes(day, direction * duration)
+        except InsufficientWorkTime:
+            self._show_adjustment_message("За выбранный день учтено меньше времени, чем нужно убрать.", error=True)
+            return
+        except ValueError:
+            self._show_adjustment_message("Указано слишком большое время.", error=True)
+            return
+        except sqlite3.Error:
+            self._show_adjustment_message("Не удалось сохранить корректировку.", error=True)
+            return
+
+        self.adjustment_hours.setStringValue_("")
+        self.adjustment_minutes.setStringValue_("")
+        action = "Добавлено" if direction > 0 else "Убрано"
+        self._show_adjustment_message(f"{action} {format_duration(duration * MICROSECONDS_PER_MINUTE)} за {day:%d.%m.%Y}.")
+        self.tick_(None)
+
+    @objc.IBAction
+    def addTime_(self, sender):
+        self._adjust_time(1)
+
+    @objc.IBAction
+    def removeTime_(self, sender):
+        self._adjust_time(-1)
 
     @objc.IBAction
     def switchView_(self, sender):
